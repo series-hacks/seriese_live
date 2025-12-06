@@ -35,7 +35,8 @@ class TwilioService:
         self,
         conference_name: str,
         phone_number: str,
-        status_callback_url: Optional[str] = None
+        status_callback_url: Optional[str] = None,
+        webhook_base_url: Optional[str] = None
     ) -> str:
         """
         Call a phone number and add them to the conference.
@@ -44,39 +45,60 @@ class TwilioService:
             conference_name: Name of the conference to join
             phone_number: E.164 formatted phone number to call
             status_callback_url: Optional webhook for call status updates
+            webhook_base_url: Base URL for webhook server (enables Media Streams)
 
         Returns:
             Call SID
         """
-        twiml = f'''
-        <Response>
-            <Dial>
-                <Conference startConferenceOnEnter="true" endConferenceOnExit="false">
-                    {conference_name}
-                </Conference>
-            </Dial>
-        </Response>
-        '''
+        if webhook_base_url:
+            # Use webhook URL for TwiML - enables Media Streams and advanced features
+            call_url = f"{webhook_base_url}/voice/answer?conference={conference_name}"
 
-        try:
-            call_params = {
-                'to': phone_number,
-                'from_': self.phone_number,
-                'twiml': twiml
-            }
+            try:
+                call = self.client.calls.create(
+                    to=phone_number,
+                    from_=self.phone_number,
+                    url=call_url,
+                    method='POST'
+                )
 
-            if status_callback_url:
-                call_params['status_callback'] = status_callback_url
-                call_params['status_callback_event'] = ['initiated', 'ringing', 'answered', 'completed']
+                logger.info(f"Called {phone_number} via webhook to join conference '{conference_name}' (Call SID: {call.sid})")
+                return call.sid
 
-            call = self.client.calls.create(**call_params)
+            except TwilioRestException as e:
+                logger.error(f"Failed to add participant {phone_number} to conference: {e}")
+                raise
+        else:
+            # Fallback to inline TwiML (no Media Streams)
+            twiml = f'''
+            <Response>
+                <Dial>
+                    <Conference startConferenceOnEnter="true" endConferenceOnExit="false">
+                        {conference_name}
+                    </Conference>
+                </Dial>
+            </Response>
+            '''
 
-            logger.info(f"Called {phone_number} to join conference '{conference_name}' (Call SID: {call.sid})")
-            return call.sid
+            try:
+                call_params = {
+                    'to': phone_number,
+                    'from_': self.phone_number,
+                    'twiml': twiml
+                }
 
-        except TwilioRestException as e:
-            logger.error(f"Failed to add participant {phone_number} to conference: {e}")
-            raise
+                if status_callback_url:
+                    call_params['status_callback'] = status_callback_url
+                    call_params['status_callback_event'] = ['initiated', 'ringing', 'answered', 'completed']
+
+                call = self.client.calls.create(**call_params)
+
+                logger.info(f"Called {phone_number} to join conference '{conference_name}' (Call SID: {call.sid})")
+                return call.sid
+
+            except TwilioRestException as e:
+                logger.error(f"Failed to add participant {phone_number} to conference: {e}")
+                raise
 
     def _get_conference_sid(self, conference_name: str) -> Optional[str]:
         """Get the SID of an active conference by name."""
