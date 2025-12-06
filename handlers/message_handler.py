@@ -3,11 +3,13 @@ import time
 import uuid
 import os
 import requests
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from services.series_api import SeriesAPI
     from services.twilio_service import TwilioService
+
+from services.matchmaking import MatchmakingService, Lobby
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +47,9 @@ MATCH_TIMEOUT_SECONDS = 300  # 5 minutes
 # Greeting patterns (case-insensitive)
 GREETINGS = {'hi', 'hello', 'hey', 'sup', 'yo', 'hola', 'whatsup', "what's up", 'howdy'}
 
+# Opt-out patterns (case-insensitive)
+OPT_OUT_COMMANDS = {'cancel', 'stop', 'leave', 'exit', 'quit', 'no'}
+
 # Command definitions
 COMMANDS = {
     'call': 'Enter the waitroom to find a call group',
@@ -76,9 +81,9 @@ class WaitRoom:
     """Simple in-memory waitroom for matchmaking."""
 
     def __init__(self):
-        self.users = {}  # phone -> {chat_id, joined_at, name}
+        self.users = {}  # phone -> {chat_id, joined_at, name, interest}
 
-    def join(self, phone: str, chat_id: str, name: str = None) -> tuple[bool, str]:
+    def join(self, phone: str, chat_id: str, name: str = None, interest: str = None) -> tuple[bool, str]:
         """Add user to waitroom. Returns (success, message)."""
         if phone in self.users:
             return False, "You're already in the waitroom! Text STATUS to check."
@@ -86,7 +91,8 @@ class WaitRoom:
         self.users[phone] = {
             'chat_id': chat_id,
             'joined_at': time.time(),
-            'name': name or phone[-4:]  # Last 4 digits as default name
+            'name': name or phone[-4:],  # Last 4 digits as default name
+            'interest': interest or ''
         }
 
         count = len(self.users)
@@ -149,7 +155,9 @@ class MessageHandler:
         self.twilio = twilio_service
         self.active_chats = {}  # phone -> chat_id mapping
         self.waitroom = WaitRoom()
-        self.pending_matches = {}  # match_id -> {phones, responses, created_at, chat_ids}
+        self.pending_matches = {}  # match_id -> {phones, responses, created_at, chat_ids, lobby}
+        self.pending_recommendations = {}  # phone -> {recommendation, match_id}
+        self.matchmaking = MatchmakingService()
 
     def handle_event(self, event: dict):
         """Route events to appropriate handlers."""
@@ -207,20 +215,41 @@ class MessageHandler:
         if text_lower in GREETINGS:
             return GREETING_RESPONSE  # Returns list for multiple messages
 
+        # Check for selection responses (1, 2, 3) for pending recommendations
+        if text_lower in ('1', '2', '3'):
+            return self.handle_lobby_selection(phone, chat_id, text_lower)
+
+        # Check if user has pending match or recommendation
+        has_pending_match = f"{phone}_pending_match" in self.active_chats
+        has_pending_rec = phone in self.pending_recommendations
+
         # Check for Yes/No responses (for pending matches)
-        if text_lower in ('yes', 'y'):
+        if text_lower in ('yes', 'y') and has_pending_match:
             return self.handle_match_response(phone, chat_id, 'yes')
 
-        if text_lower in ('no', 'n'):
+        if text_lower in ('no', 'n') and has_pending_match:
             return self.handle_match_response(phone, chat_id, 'no')
+
+        # Check for opt-out commands (if no pending match/recommendation, or explicit opt-out)
+        opt_out_keywords = {'cancel', 'stop', 'leave', 'exit', 'quit'}
+        if text_lower in opt_out_keywords or (text_lower in ('no', 'n') and not has_pending_match):
+            return self.handle_opt_out(phone, chat_id)
 
         # Check for commands
         if text_lower == 'help':
             return HELP_TEXT
 
-        if text_lower == 'call':
-            success, msg = self.waitroom.join(phone, chat_id)
+        if text_lower == 'call' or text_lower.startswith('join call'):
+            # Extract interest if provided
+            interest = None
+            if text_lower.startswith('join call'):
+                interest = text[len('join call'):].strip() or None
+            
+            success, msg = self.waitroom.join(phone, chat_id, interest=interest)
             if success:
+                # If interest provided, show recommendations
+                if interest:
+                    return self.handle_interest_based_match(phone, chat_id, text)
                 # SIMULATION MODE: Auto-add simulated user to waitroom
                 if SIMULATION_MODE and phone == REAL_PHONE:
                     logger.info(f"[SIMULATION] Auto-joining {SIMULATED_PHONE} to waitroom")
@@ -243,8 +272,211 @@ class MessageHandler:
         if text_lower == 'list':
             return self.waitroom.list_users(exclude_phone=phone)
 
+        # Check if this looks like an interest-based message
+        interest_keywords = ['want to', 'talk about', 'discuss', 'join call', 'playing', 'i want']
+        if any(keyword in text_lower for keyword in interest_keywords) or len(text_lower.split()) <= 10:
+            # Treat as interest-based message
+            return self.handle_interest_based_match(phone, chat_id, text)
+
         # Unknown command - show help hint
         return f"I didn't understand that. Text Help to see available commands."
+
+    def handle_interest_based_match(self, phone: str, chat_id: str, text: str) -> str:
+        """
+        Handle interest-based matching: show recommendations to user.
+        
+        Args:
+            phone: User's phone number
+            chat_id: Chat ID
+            text: Original message text
+            
+        Returns:
+            Response message
+        """
+        # Get matchmaking recommendations
+        recommendation = self.matchmaking.find_matches(text)
+        
+        # Format recommendations message
+        msg = self.matchmaking.format_recommendations(recommendation)
+        
+        # Store recommendation for this user
+        match_id = str(uuid.uuid4())[:8]
+        self.pending_recommendations[phone] = {
+            'recommendation': recommendation,
+            'match_id': match_id
+        }
+        
+        # Add user to waitroom with their interest
+        interest = self.matchmaking.extract_interest(text)
+        user_name = USER_PROFILES.get(phone, {}).get('name') or phone[-4:]
+        self.waitroom.join(phone, chat_id, name=user_name, interest=interest)
+        
+        logger.info(f"Showing recommendations to {phone}: best_fit={recommendation.best_fit.name if recommendation.best_fit else None}")
+        
+        return msg
+
+    def handle_lobby_selection(self, phone: str, chat_id: str, selection: str) -> str:
+        """
+        Handle user's lobby selection (1, 2, or 3).
+        
+        Args:
+            phone: User's phone number
+            chat_id: Chat ID
+            selection: User's selection ("1", "2", or "3")
+            
+        Returns:
+            Response message
+        """
+        # Check if user has pending recommendations
+        if phone not in self.pending_recommendations:
+            return "You don't have any pending recommendations. Send your interest to get matched!"
+        
+        pending_rec = self.pending_recommendations[phone]
+        recommendation = pending_rec['recommendation']
+        match_id = pending_rec['match_id']
+        
+        # Clear pending recommendation
+        del self.pending_recommendations[phone]
+        
+        # Get selected lobby
+        selected_lobby = None
+        if selection == "1":
+            selected_lobby = recommendation.best_fit
+        elif selection == "2":
+            selected_lobby = recommendation.worst_fit
+        elif selection == "3":
+            # Create new lobby - for demo, just match with any available lobby
+            # In production, this would create a new lobby
+            selected_lobby = None
+            return "Creating a new lobby... For this demo, please select option 1 or 2."
+        
+        if not selected_lobby:
+            return "Invalid selection. Please try again."
+        
+        logger.info(f"{phone} selected lobby: {selected_lobby.name} (option {selection})")
+        
+        # Match user with lobby host
+        return self.match_user_to_lobby(phone, chat_id, selected_lobby, match_id)
+
+    def match_user_to_lobby(self, phone: str, chat_id: str, lobby: Lobby, match_id: str) -> str:
+        """
+        Match user to a lobby host and initiate confirmation.
+        
+        Args:
+            phone: User's phone number
+            chat_id: User's chat ID
+            lobby: Selected lobby
+            match_id: Match ID
+            
+        Returns:
+            Response message
+        """
+        host_phone = lobby.host_phone
+        host_profile = USER_PROFILES.get(host_phone, {})
+        host_name = host_profile.get('name', lobby.host_name)
+        
+        # Check if host is available (in waitroom or can be matched)
+        # For demo, we'll always try to match
+        phones = [phone, host_phone]
+        
+        # Get host's chat_id if available (they might be in waitroom)
+        host_chat_id = None
+        if host_phone in self.waitroom.users:
+            host_chat_id = self.waitroom.users[host_phone]['chat_id']
+        else:
+            # For demo, use a placeholder - in production, you'd need to contact the host
+            host_chat_id = 'host-chat-id'
+        
+        chat_ids = {
+            phone: chat_id,
+            host_phone: host_chat_id
+        }
+        
+        # Create pending match
+        self.pending_matches[match_id] = {
+            'phones': phones,
+            'chat_ids': chat_ids,
+            'responses': {},  # phone -> 'yes' | 'no'
+            'created_at': time.time(),
+            'lobby': lobby
+        }
+        
+        # Remove user from waitroom (they're now in pending match)
+        self.waitroom.clear_users([phone])
+        
+        # Store match_id for user
+        self.active_chats[f"{phone}_pending_match"] = match_id
+        
+        # SIMULATION MODE: Auto-accept for host if simulated
+        if SIMULATION_MODE and host_phone == SIMULATED_PHONE:
+            logger.info(f"[SIMULATION] Auto-accepting match for host {host_phone}")
+            self.pending_matches[match_id]['responses'][host_phone] = 'yes'
+            self.active_chats[f"{host_phone}_pending_match"] = match_id
+        
+        # Send confirmation request to user
+        msg = f"Match found! Here's who wants to connect:\n\n"
+        msg += f"{host_name}\n"
+        if host_profile.get('title'):
+            msg += f"{host_profile.get('title')}\n"
+        if host_profile.get('bio'):
+            msg += f"{host_profile.get('bio')}\n"
+        if host_profile.get('interests'):
+            msg += f"Interests: {host_profile.get('interests')}\n"
+        msg += f"\nReply 'Yes' to connect or 'No' to skip. (5 min to respond)"
+        
+        # Notify host (if they're available and not simulated)
+        if not (SIMULATION_MODE and host_phone == SIMULATED_PHONE):
+            user_profile = USER_PROFILES.get(phone, {})
+            user_name = user_profile.get('name', phone[-4:])
+            host_msg = f"Someone wants to join your {lobby.name} lobby:\n\n"
+            host_msg += f"{user_name}\n"
+            if user_profile.get('title'):
+                host_msg += f"{user_profile.get('title')}\n"
+            if user_profile.get('interests'):
+                host_msg += f"Interests: {user_profile.get('interests')}\n"
+            host_msg += f"\nReply 'Yes' to connect or 'No' to skip."
+            
+            if host_chat_id and host_chat_id != 'host-chat-id':
+                try:
+                    self.series.send_message(int(host_chat_id), host_msg)
+                    self.active_chats[f"{host_phone}_pending_match"] = match_id
+                except Exception as e:
+                    logger.error(f"Failed to notify host {host_phone}: {e}")
+        
+        return msg
+
+    def handle_opt_out(self, phone: str, chat_id: str) -> str:
+        """
+        Handle opt-out scenarios: remove user from matchmaking queue.
+        
+        Args:
+            phone: User's phone number
+            chat_id: Chat ID
+            
+        Returns:
+            Response message
+        """
+        # Check for pending matches first (canceling takes precedence)
+        match_id = self.active_chats.get(f"{phone}_pending_match")
+        if match_id and match_id in self.pending_matches:
+            return self.cancel_match(match_id, phone, "declined")
+        
+        # Remove from waitroom
+        was_in_waitroom = phone in self.waitroom.users
+        if was_in_waitroom:
+            self.waitroom.leave(phone)
+        
+        # Remove pending recommendations
+        had_recommendation = phone in self.pending_recommendations
+        if had_recommendation:
+            del self.pending_recommendations[phone]
+        
+        if was_in_waitroom:
+            return "You've left the waitroom. Text Call to enter again anytime!"
+        elif had_recommendation:
+            return "You've canceled your matchmaking request. You won't be matched or called."
+        else:
+            return "You're not in the matchmaking queue."
 
     def check_for_match(self, min_size: int = 2):
         """Check if we have enough people to start a call. Sends confirmation requests."""
@@ -400,8 +632,9 @@ class MessageHandler:
         match = self.pending_matches[match_id]
         phones = match['phones']
         chat_ids = match['chat_ids']
+        lobby = match.get('lobby')  # May be None for legacy matches
 
-        logger.info(f"Initiating call for match {match_id} with {phones}")
+        logger.info(f"Initiating call for match {match_id} with {phones}, lobby={lobby.name if lobby else None}")
 
         # Notify all users that call is starting
         for phone in phones:
